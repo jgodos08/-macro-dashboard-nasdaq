@@ -13,6 +13,7 @@ Cómo correrlo:
 Autor: generado con Claude para Tathiana.
 """
 
+import time
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -21,6 +22,21 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
 from datetime import datetime, timedelta
+
+try:
+    from curl_cffi import requests as cffi_requests
+    _HAS_CURL_CFFI = True
+except Exception:
+    _HAS_CURL_CFFI = False
+
+
+@st.cache_resource(show_spinner=False)
+def get_yf_session():
+    """Sesión que imita un navegador real para evitar el bloqueo 429 de
+    Yahoo Finance en IPs compartidas (como las de Streamlit Cloud)."""
+    if _HAS_CURL_CFFI:
+        return cffi_requests.Session(impersonate="chrome")
+    return None
 
 # ----------------------------------------------------------------------------
 # CONFIGURACIÓN GENERAL
@@ -75,21 +91,30 @@ FRED_SERIES = {
 # ----------------------------------------------------------------------------
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_yf(ticker: str, period: str = "2y", interval: str = "1d"):
-    """Descarga datos de Yahoo Finance y devuelve una Serie de cierre limpia."""
-    try:
-        df = yf.download(ticker, period=period, interval=interval, progress=False)
-        if df is None or df.empty:
-            return None
-        # yfinance a veces devuelve columnas MultiIndex (Ticker, Campo)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        close = df["Close"].dropna()
-        close.name = ticker
-        return close
-    except Exception:
-        return None
+    """Descarga datos de Yahoo Finance y devuelve una Serie de cierre limpia.
+    Reintenta con backoff exponencial si Yahoo responde 'Too Many Requests'."""
+    session = get_yf_session()
+    for attempt in range(4):
+        try:
+            df = yf.download(
+                ticker, period=period, interval=interval, progress=False, session=session
+            )
+            if df is None or df.empty:
+                raise ValueError("respuesta vacía")
+            # yfinance a veces devuelve columnas MultiIndex (Ticker, Campo)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            close = df["Close"].dropna()
+            close.name = ticker
+            return close
+        except Exception:
+            if attempt < 3:
+                time.sleep(2 ** attempt + 1)  # 2s, 3s, 5s
+            else:
+                return None
+    return None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -201,8 +226,11 @@ st.caption(
 
 if nasdaq is None:
     st.error(
-        "No se pudo descargar la data del Nasdaq. Revisa tu conexión a "
-        "internet o intenta de nuevo en unos minutos."
+        "No se pudo descargar la data del Nasdaq. Yahoo Finance puede estar "
+        "limitando temporalmente las peticiones (error 429). Espera 1-2 "
+        "minutos y recarga la página (botón 'Rerun' o F5). Si el problema "
+        "persiste varias horas, es un bloqueo temporal del lado de Yahoo, "
+        "no un error del dashboard."
     )
     st.stop()
 
